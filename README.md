@@ -28,6 +28,7 @@ hot_function_bytecode_exact=True
 structural_added_hotpath_bytecodes=0
 structural_per_call_obfuscation_overhead_pct=0.0000
 PASS=True
+```
 
 HKD (Hilbert–Krylov Decomposition) is a broader research program investigating structured contraction, active-state reduction, and effective-complexity reduction in computational problems.
 
