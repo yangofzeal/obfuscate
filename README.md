@@ -10,6 +10,7 @@ No platform-specific distribution is required.
 
 ```bash
 python obfuscate.py input.py protected.py
+```
 
 ## Runtime Overhead: 0.00% Added Hot-Path Bytecode
 
