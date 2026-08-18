@@ -1,99 +1,139 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-HKD Obfuscate Public
-Static CPython source obfuscation with zero per-call protection runtime.
+HKD Obfuscate v4 - portable source-payload obfuscation for CPython 3.4.3+.
 
-Security model:
-- Plain source is not shipped.
-- The compiled payload is compressed, block-scrambled, masked, and SHA-256 verified.
-- HKD block-richness + exact meet-in-the-middle partitioning balances the two
-  storage lanes before keyed permutation.
-- All reconstruction happens once at import. Protected functions then execute
-  as ordinary CPython functions with their original bytecode.
+Design goals:
+- Never serialize Python code objects.  No marshal dependency.
+- Emit only syntax/APIs available in Python 3.4.3 and still supported by modern CPython.
+- Compile the protected source on the destination interpreter.
+- Execute protected source directly in the module's real globals dictionary.
+- Add no wrapper, hook, decorator, proxy, tracing, or per-call work to protected functions.
+  After import, protected functions are ordinary CPython functions.
 
-This is obfuscation + integrity, not cryptographic secrecy: a determined
-attacker controlling the Python process can still inspect runtime code objects.
+Important:
+- There is necessarily one-time import work: reconstruct, verify, decompress, decode,
+  compile, and exec.  "Zero overhead" here means zero added steady-state/per-call
+  overhead after import, not zero import-time cost.
+- The protected source itself must be valid on every Python version on which it is
+  expected to run.  Building it with Python 3.4.3 is a strong syntax/API gate for
+  the oldest target, but this tool cannot make version-specific application code
+  portable automatically.
+- This is obfuscation and integrity protection, not cryptographic secrecy.  Code
+  executing in a Python process can ultimately be inspected by a determined user.
 """
+
+from __future__ import print_function
 
 import argparse
 import binascii
 import hashlib
+import io
 import math
-import marshal
 import os
 import random
+import struct
 import sys
 import zlib
 
 
 def _sha256(data):
-    # Named hashlib constructors are Python's fast path.
     return hashlib.sha256(data).digest()
+
+
+def _u32(n):
+    if n < 0 or n > 0xffffffff:
+        raise ValueError("integer does not fit in 32 bits")
+    return struct.pack(">I", n)
+
+
+def _xor_bytes(a, b):
+    if len(a) != len(b):
+        raise ValueError("xor operands differ in length")
+    out = bytearray(len(a))
+    i = 0
+    while i < len(a):
+        out[i] = a[i] ^ b[i]
+        i += 1
+    return bytes(out)
 
 
 def _entropy(block):
     if not block:
         return 0.0
     counts = [0] * 256
-    for b in block:
-        counts[b] += 1
-    n = float(len(block))
-    e = 0.0
-    for c in counts:
-        if c:
-            p = c / n
-            e -= p * math.log(p, 2)
-    return e
+    for value in block:
+        counts[value] += 1
+    total = float(len(block))
+    result = 0.0
+    for count in counts:
+        if count:
+            p = count / total
+            result -= p * math.log(p, 2)
+    return result
 
 
 def _richness(block):
-    # Integer score: information density + byte diversity + payload mass.
-    return int(_entropy(block) * 3072) + len(set(block)) * 48 + len(block) * 3
+    return int(_entropy(block) * 4096) + len(set(block)) * 64 + len(block)
 
 
 def _mitm_balance(scores):
-    """Exact subset-sum balance closest to half total; practical for <= 28 blocks."""
+    """Choose a subset whose score is closest to half the total.
+
+    Work is bounded by splitting long inputs into exact 28-block windows.
+    This is build-time only and therefore cannot affect protected-call speed.
+    """
     n = len(scores)
     if n == 0:
         return set()
-    if n > 24:
-        # Windowed exact MITM keeps build cost bounded while retaining exact
-        # balance inside each window.
+
+    if n > 28:
         chosen = set()
         base = 0
-        for start in range(0, n, 24):
-            sub = scores[start:start + 24]
-            for i in _mitm_balance(sub):
-                chosen.add(base + i)
+        start = 0
+        while start < n:
+            sub = scores[start:start + 28]
+            for index in _mitm_balance(sub):
+                chosen.add(base + index)
             base += len(sub)
+            start += 28
         return chosen
 
-    m = n // 2
-    a, b = scores[:m], scores[m:]
+    middle = n // 2
+    left_scores = scores[:middle]
+    right_scores = scores[middle:]
 
     left = []
-    for mask in range(1 << len(a)):
-        s = 0
-        for i, v in enumerate(a):
-            if mask >> i & 1:
-                s += v
-        left.append((s, mask))
+    mask = 0
+    while mask < (1 << len(left_scores)):
+        score = 0
+        i = 0
+        while i < len(left_scores):
+            if (mask >> i) & 1:
+                score += left_scores[i]
+            i += 1
+        left.append((score, mask))
+        mask += 1
     left.sort()
 
     right = []
-    for mask in range(1 << len(b)):
-        s = 0
-        for i, v in enumerate(b):
-            if mask >> i & 1:
-                s += v
-        right.append((s, mask))
+    mask = 0
+    while mask < (1 << len(right_scores)):
+        score = 0
+        i = 0
+        while i < len(right_scores):
+            if (mask >> i) & 1:
+                score += right_scores[i]
+            i += 1
+        right.append((score, mask))
+        mask += 1
 
     target = sum(scores) / 2.0
     best = None
-    j = len(left) - 1
-    for sr, mr in right:
-        want = target - sr
-        lo, hi = 0, len(left)
+    for right_score, right_mask in right:
+        want = target - right_score
+        lo = 0
+        hi = len(left)
         while lo < hi:
             mid = (lo + hi) // 2
             if left[mid][0] < want:
@@ -102,34 +142,38 @@ def _mitm_balance(scores):
                 hi = mid
         for k in (lo - 1, lo):
             if 0 <= k < len(left):
-                sl, ml = left[k]
-                err = abs((sl + sr) - target)
-                if best is None or err < best[0]:
-                    best = (err, ml, mr)
+                left_score, left_mask = left[k]
+                error = abs((left_score + right_score) - target)
+                if best is None or error < best[0]:
+                    best = (error, left_mask, right_mask)
 
-    _, ml, mr = best
-    out = set()
-    for i in range(len(a)):
-        if ml >> i & 1:
-            out.add(i)
-    for i in range(len(b)):
-        if mr >> i & 1:
-            out.add(m + i)
-    return out
+    chosen = set()
+    left_mask = best[1]
+    right_mask = best[2]
+
+    i = 0
+    while i < len(left_scores):
+        if (left_mask >> i) & 1:
+            chosen.add(i)
+        i += 1
+
+    i = 0
+    while i < len(right_scores):
+        if (right_mask >> i) & 1:
+            chosen.add(middle + i)
+        i += 1
+
+    return chosen
 
 
-def _keystream(key, index, n):
+def _keystream(key, index, length):
     out = bytearray()
     counter = 0
-    seed = key + index.to_bytes(4, "big")
-    while len(out) < n:
-        out.extend(_sha256(seed + counter.to_bytes(4, "big")))
+    seed = key + _u32(index)
+    while len(out) < length:
+        out.extend(_sha256(seed + _u32(counter)))
         counter += 1
-    return bytes(out[:n])
-
-
-def _xor(a, b):
-    return bytes(x ^ y for x, y in zip(a, b))
+    return bytes(out[:length])
 
 
 def _merkle_root(leaves):
@@ -139,22 +183,38 @@ def _merkle_root(leaves):
     while len(level) > 1:
         if len(level) & 1:
             level.append(level[-1])
-        level = [_sha256(level[i] + level[i + 1])
-                 for i in range(0, len(level), 2)]
+        next_level = []
+        i = 0
+        while i < len(level):
+            next_level.append(_sha256(level[i] + level[i + 1]))
+            i += 2
+        level = next_level
     return level[0]
 
 
+def _seed_integer(data):
+    # Avoid int.from_bytes so the emitted/build-side compatibility surface is tiny.
+    return int(binascii.hexlify(data), 16)
+
+
 def _protect(data, key, block_size):
-    blocks = [data[i:i + block_size] for i in range(0, len(data), block_size)]
-    scores = [_richness(b) for b in blocks]
+    blocks = []
+    start = 0
+    while start < len(data):
+        blocks.append(data[start:start + block_size])
+        start += block_size
+
+    if not blocks:
+        blocks = [b""]
+
+    scores = [_richness(block) for block in blocks]
     lane_a = _mitm_balance(scores)
 
-    # Keyed order within the two richness-balanced lanes.
-    def rank(i):
-        return _sha256(key + i.to_bytes(4, "big") + _sha256(blocks[i]))
+    def rank(index):
+        return _sha256(key + _u32(index) + _sha256(blocks[index]))
 
-    a = sorted((i for i in range(len(blocks)) if i in lane_a), key=rank)
-    b = sorted((i for i in range(len(blocks)) if i not in lane_a), key=rank)
+    a = sorted([i for i in range(len(blocks)) if i in lane_a], key=rank)
+    b = sorted([i for i in range(len(blocks)) if i not in lane_a], key=rank)
 
     order = []
     while a or b:
@@ -166,113 +226,166 @@ def _protect(data, key, block_size):
     protected = []
     leaves = [None] * len(blocks)
     original_to_stored = [0] * len(blocks)
-    for stored_pos, original_index in enumerate(order):
+
+    stored_position = 0
+    for original_index in order:
         raw = blocks[original_index]
-        masked = _xor(raw, _keystream(key, original_index, len(raw)))
+        masked = _xor_bytes(raw, _keystream(key, original_index, len(raw)))
         protected.append(masked)
-        leaves[original_index] = _sha256(original_index.to_bytes(4, "big") + raw)
-        original_to_stored[original_index] = stored_pos
+        leaves[original_index] = _sha256(_u32(original_index) + raw)
+        original_to_stored[original_index] = stored_position
+        stored_position += 1
 
-    # Split the embedded key into two XOR shares. This is concealment, not
-    # cryptographic key storage; both shares necessarily ship with the loader.
-    rng = random.Random(int.from_bytes(_sha256(key + b"HKD-PUBLIC-SHARE-v1")[:16], "big"))
-    share1 = bytes(rng.randrange(256) for _ in key)
-    share2 = _xor(key, share1)
+    rng = random.Random(_seed_integer(_sha256(key + b"HKD-V4-SHARE")[:16]))
+    share1 = bytes(bytearray([rng.randrange(256) for _ in range(len(key))]))
+    share2 = _xor_bytes(key, share1)
 
-    return protected, original_to_stored, leaves, _merkle_root(leaves), share1, share2, scores
+    return (protected, original_to_stored, leaves,
+            _merkle_root(leaves), share1, share2, scores)
 
 
-def obfuscate_source(source_path, output_path, key, block_size=192):
+def _hex(data):
+    return binascii.hexlify(data).decode("ascii")
+
+
+def _hex_expr(data):
+    # binascii.unhexlify has existed for far longer than the minimum target.
+    return "_hb.unhexlify(%r)" % _hex(data)
+
+
+def _generated_loader(blocks, inverse, leaves, root, share1, share2):
+    block_literals = ",\n        ".join(_hex_expr(item) for item in blocks)
+    leaf_literals = ",\n        ".join(_hex_expr(item) for item in leaves)
+
+    # Everything used only by the loader lives inside _hkd_v4_bootstrap(), except
+    # the function name itself.  The protected program is exec'd directly into the
+    # real module globals dictionary, preserving ordinary Python global semantics.
+    return '''# -*- coding: utf-8 -*-
+# HKD OBFUSCATE v4 - portable source payload, no marshal/code-object dependency.
+# Protection is import-time only; protected functions have no per-call wrapper.
+def _hkd_v4_bootstrap(_g):
+    import binascii as _hb
+    import hashlib as _hh
+    import struct as _hs
+    import zlib as _hz
+
+    _b = (
+        %s,
+    )
+    _inv = %r
+    _leaves = (
+        %s,
+    )
+    _root = _hb.unhexlify(%r)
+    _share1 = _hb.unhexlify(%r)
+    _share2 = _hb.unhexlify(%r)
+
+    def _u32(_n):
+        return _hs.pack('>I', _n)
+
+    def _xor(_a, _c):
+        _o = bytearray(len(_a))
+        _i = 0
+        while _i < len(_a):
+            _o[_i] = _a[_i] ^ _c[_i]
+            _i += 1
+        return bytes(_o)
+
+    def _ks(_key, _index, _length):
+        _o = bytearray()
+        _counter = 0
+        _seed = _key + _u32(_index)
+        while len(_o) < _length:
+            _o.extend(_hh.sha256(_seed + _u32(_counter)).digest())
+            _counter += 1
+        return bytes(_o[:_length])
+
+    def _merkle(_values):
+        if not _values:
+            return _hh.sha256(b'').digest()
+        _level = list(_values)
+        while len(_level) > 1:
+            if len(_level) & 1:
+                _level.append(_level[-1])
+            _next = []
+            _i = 0
+            while _i < len(_level):
+                _next.append(_hh.sha256(_level[_i] + _level[_i + 1]).digest())
+                _i += 2
+            _level = _next
+        return _level[0]
+
+    _key = _xor(_share1, _share2)
+    _parts = []
+    _verify = []
+    _i = 0
+    while _i < len(_inv):
+        _masked = _b[_inv[_i]]
+        _raw = _xor(_masked, _ks(_key, _i, len(_masked)))
+        _parts.append(_raw)
+        _verify.append(_hh.sha256(_u32(_i) + _raw).digest())
+        _i += 1
+
+    if tuple(_verify) != _leaves or _merkle(_verify) != _root:
+        raise ImportError('HKD protected payload integrity verification failed')
+
+    try:
+        _source = _hz.decompress(b''.join(_parts)).decode('utf-8')
+    except Exception as _exc:
+        raise ImportError('HKD protected payload reconstruction failed: %%s' %% (_exc,))
+
+    _filename = _g.get('__file__') or '<HKD-obfuscated>'
+    _code = compile(_source, _filename, 'exec', 0, True, 0)
+
+    # Discard the plaintext string before running user code.  CPython may reclaim
+    # it immediately; no plaintext source is retained as a module global.
+    del _source
+
+    # Exact module semantics: definitions execute in the actual module globals.
+    exec(_code, _g, _g)
+
+_hkd_v4_bootstrap(globals())
+del _hkd_v4_bootstrap
+''' % (
+        block_literals,
+        tuple(inverse),
+        leaf_literals,
+        _hex(root),
+        _hex(share1),
+        _hex(share2)
+    )
+
+
+def obfuscate_source(source_path, output_path, key, block_size=128):
+    if block_size <= 0:
+        raise ValueError("block size must be greater than zero")
+    if block_size > 0xffffffff:
+        raise ValueError("block size is too large")
+
     source_path = os.path.abspath(source_path)
     output_path = os.path.abspath(output_path)
-    with open(source_path, "r", encoding="utf-8") as f:
-        source = f.read()
 
-    # optimize=0 preserves ordinary source execution semantics, including asserts.
-    code = compile(source, str(source_path), "exec",
-                   dont_inherit=True, optimize=0)
-    raw = marshal.dumps(code)
+    with open(source_path, "rb") as handle:
+        source_bytes = handle.read()
+
+    try:
+        source = source_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError("source must be UTF-8 encoded")
+
+    # Crucial portability rule: validate source, but never serialize this code object.
+    compile(source, source_path, "exec", 0, True, 0)
+
+    raw = source.encode("utf-8")
     packed = zlib.compress(raw, 9)
-
     key_bytes = _sha256(key.encode("utf-8"))
-    blocks, inverse, leaves, root, s1, s2, scores = _protect(
+
+    protected, inverse, leaves, root, share1, share2, scores = _protect(
         packed, key_bytes, block_size
     )
 
-    literals = ",\n".join("bytes.fromhex(%r)" % binascii.hexlify(x).decode('ascii') for x in blocks)
-    leaf_literals = ",\n".join("bytes.fromhex(%r)" % binascii.hexlify(x).decode('ascii') for x in leaves)
-
-    loader = """# HKD OBFUSCATE PUBLIC — STATIC PROTECTED MODULE
-# CPython %d.%d; all protection work occurs at import, never per function call.
-import hashlib as _hh
-import marshal as _hm
-import zlib as _hz
-
-_B=(%s,)
-_I=%r
-_L=(%s,)
-_R=bytes.fromhex(%r)
-_S1=bytes.fromhex(%r)
-_S2=bytes.fromhex(%r)
-
-def _x(a,b):
-    return bytes(i^j for i,j in zip(a,b))
-
-def _ks(k,idx,n):
-    o=bytearray(); c=0; s=k+idx.to_bytes(4,'big')
-    while len(o)<n:
-        o.extend(_hh.sha256(s+c.to_bytes(4,'big')).digest()); c+=1
-    return bytes(o[:n])
-
-def _mr(v):
-    if not v:
-        return _hh.sha256(b'').digest()
-    v=list(v)
-    while len(v)>1:
-        if len(v)&1: v.append(v[-1])
-        v=[_hh.sha256(v[i]+v[i+1]).digest() for i in range(0,len(v),2)]
-    return v[0]
-
-_K=_x(_S1,_S2)
-_P=[]
-_V=[]
-for _i in range(len(_I)):
-    _m=_B[_I[_i]]
-    _r=_x(_m,_ks(_K,_i,len(_m)))
-    _P.append(_r)
-    _V.append(_hh.sha256(_i.to_bytes(4,'big')+_r).digest())
-if tuple(_V)!=_L or _mr(_V)!=_R:
-    raise ImportError('HKD public SHA-256 integrity verification failed')
-
-_C=_hm.loads(_hz.decompress(b''.join(_P)))
-
-# Execute protected code in a fresh module-shaped namespace. This is critical
-# for hot paths: loader temporaries never contaminate the function globals
-# dictionary with deleted slots/tombstones.
-_G=globals()
-_N={
-    '__name__':_G.get('__name__'),
-    '__doc__':_G.get('__doc__'),
-    '__package__':_G.get('__package__'),
-    '__loader__':_G.get('__loader__'),
-    '__spec__':_G.get('__spec__'),
-    '__file__':_G.get('__file__'),
-    '__cached__':_G.get('__cached__'),
-    '__builtins__':_G.get('__builtins__'),
-}
-exec(_C,_N,_N)
-
-# Publish source-defined names to the actual module object. Functions keep _N
-# as __globals__, matching a clean normal module execution environment.
-for _q,_v in _N.items():
-    if _q != '__builtins__':
-        _G[_q]=_v
-
-del _B,_I,_L,_R,_S1,_S2,_K,_P,_V,_C,_i,_m,_r,_x,_ks,_mr,_q,_v,_N,_G,_hh,_hm,_hz
-""" % (
-        sys.version_info[0], sys.version_info[1],
-        literals, tuple(inverse), leaf_literals, binascii.hexlify(root).decode('ascii'),
-        binascii.hexlify(s1).decode('ascii'), binascii.hexlify(s2).decode('ascii')
+    loader = _generated_loader(
+        protected, inverse, leaves, root, share1, share2
     )
 
     parent = os.path.dirname(output_path)
@@ -282,33 +395,62 @@ del _B,_I,_L,_R,_S1,_S2,_K,_P,_V,_C,_i,_m,_r,_x,_ks,_mr,_q,_v,_N,_G,_hh,_hm,_hz
         except OSError:
             if not os.path.isdir(parent):
                 raise
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(loader)
+
+    with io.open(output_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(loader)
+
+    # Validate the generated loader with the builder interpreter too.
+    compile(loader, output_path, "exec", 0, True, 0)
 
     return {
-        "source_bytes": len(source.encode("utf-8")),
-        "marshal_bytes": len(raw),
+        "source_bytes": len(raw),
         "packed_bytes": len(packed),
-        "blocks": len(blocks),
+        "blocks": len(protected),
         "block_size": block_size,
         "richness_total": sum(scores),
-        "sha256_merkle": binascii.hexlify(root).decode('ascii'),
-        "python": "%d.%d" % sys.version_info[:2],
-        "output": str(output_path),
+        "sha256_merkle": _hex(root),
+        "builder_python": "%d.%d.%d" % sys.version_info[:3],
+        "payload": "utf8-source",
+        "marshal_code_objects": "NO",
+        "per_call_wrapper": "NO",
+        "target_min_python": "3.4.3",
+        "output": output_path,
     }
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("source")
-    p.add_argument("output")
-    p.add_argument("--key", default=os.environ.get("HKD_OBFUSCATE_KEY", "HKD-PUBLIC-v1"))
-    p.add_argument("--block-size", type=int, default=192)
-    a = p.parse_args()
-    info = obfuscate_source(a.source, a.output, a.key, a.block_size)
-    for k in ("source_bytes", "marshal_bytes", "packed_bytes", "blocks",
-              "block_size", "richness_total", "sha256_merkle", "python", "output"):
-        print("%s=%s" % (k, info[k]))
+    parser = argparse.ArgumentParser(
+        description="Portable HKD source obfuscator for CPython 3.4.3+"
+    )
+    parser.add_argument("source")
+    parser.add_argument("output")
+    parser.add_argument(
+        "--key",
+        default=os.environ.get("HKD_OBFUSCATE_KEY", "HKD-INF")
+    )
+    parser.add_argument("--block-size", type=int, default=128)
+    args = parser.parse_args()
+
+    info = obfuscate_source(
+        args.source, args.output, args.key, args.block_size
+    )
+
+    fields = (
+        "source_bytes",
+        "packed_bytes",
+        "blocks",
+        "block_size",
+        "richness_total",
+        "sha256_merkle",
+        "builder_python",
+        "payload",
+        "marshal_code_objects",
+        "per_call_wrapper",
+        "target_min_python",
+        "output",
+    )
+    for field in fields:
+        print("%s=%s" % (field, info[field]))
 
 
 if __name__ == "__main__":
